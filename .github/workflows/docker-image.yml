@@ -1,0 +1,172 @@
+# 自动构建 docker 镜像
+name: Docker Build -> gsuid-core-CN
+
+# 参数配置为环境变量
+env:
+  # tag_prefix 软件包名称，通常为 docker hub 用户名/软件包名称
+  # tag_version docker 包版本，后续要实现自动打（可能得加 actions 里边的插件）
+  # dockerfile_path Dockerfile 路径
+  # build_branch 构建分支
+  tag_prefix: "alniyata/gsuid-core-cn"
+  tag_version: "latest"
+  dockerfile_path: "Dockerfile.cn"
+  build_branch: "master"
+  # 其他要指定的变量 DOCKER_USERNAME 和 DOCKER_PASSWORD 需要在仓库的 设置 --> secrets 里边配置
+  # DOCKER_USERNAME = docker hub 用户名
+  # DOCKER_PASSWORD = docker hub 密码
+
+on:
+  # docker-autobuild 分支 push 事件触发
+  # push:
+  #   branches:
+  #     - docker-autobuild
+  # 定时执行：每半天（12小时）执行一次
+  schedule:
+    - cron:  '0 */12 * * *'
+  # 手动脚本
+  workflow_dispatch:
+    inputs:
+      test_no_compile:
+        description: '测试，不编译镜像... | Manual Mode...'
+        type: boolean
+        default: false
+      test_no_push:
+        description: '测试，不发布镜像... | Manual Mode...'
+        type: boolean
+        default: false
+
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout the repository
+      uses: actions/checkout@v2
+      with:
+        ref: ${{ env.build_branch }}
+
+    - name: Set up Docker
+      if: ${{ inputs.test_no_compile == false }}
+      uses: docker/setup-buildx-action@v2
+
+    - name: Install Docker and Docker Compose
+      if: ${{ inputs.test_no_compile == false }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          apt-transport-https \
+          ca-certificates \
+          curl \
+          gnupg \
+          lsb-release
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        echo \
+          "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+          $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        sudo apt-get update
+        sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        sudo systemctl start docker
+        sudo systemctl enable docker
+
+    - name: Show current files
+      run: |
+        echo "pwd = $(pwd)"
+        echo -------- ls -al --------------
+        ls -al
+        echo ------------------------------
+
+    # 不需要手动clone，actions/checkout@v2 已经自动 clone 了
+    # - name: Clone gsuid-core repository && branch
+    #   run: |
+    #     git clone -b master https://github.com/Genshin-bots/gsuid_core.git --depth=1 --single-branch
+    #     ls -al
+    #     chmod 777 -R gsuid_core
+
+    - name: 基础插件安装 (GenshinUID) | Clone GenshinUID plugin (v4)
+      run: |
+        echo "pwd = $(pwd)"
+        echo -------- ls -al --------------
+        ls -al
+        echo -----------------------------
+        [ -d ./gsuid_core/plugins ] && echo "plugin path exists, contine..." || mkdir -p ./gsuid_core/plugins
+        cd ./gsuid_core/plugins
+        git clone -b v4 https://github.com/KimigaiiWuyi/GenshinUID.git --depth=1 --single-branch
+
+    - name: login docker hub
+      if: ${{ inputs.test_no_compile == false || inputs.test_no_push == false}}
+      run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+    - name: build & tag images
+      if: ${{ inputs.test_no_compile == false }}
+      run: |
+        echo "pwd = $(pwd)"
+        echo -------- ls -al --------------
+        ls -al
+        echo -----------------------------
+        docker build -t ${{ env.tag_prefix }}:${{ env.tag_version }} -f ${{ env.dockerfile_path }} .
+        docker images
+
+    - name: export docker image
+      if: ${{ inputs.test_no_compile == false }}
+      run: |
+        echo "pwd = $(pwd)"
+        echo -------- ls -al --------------
+        ls -al
+        echo -----------------------------
+        docker save -o gsuid-core.tar ${{ env.tag_prefix }}:${{ env.tag_version }}
+
+    - name: Push to Docker Hub
+      if: ${{ inputs.test_no_push == false }}
+      run: |
+        docker push ${{ env.tag_prefix }}:${{ env.tag_version }}
+
+    - name: prepare messages for feishu sending
+      run: |
+        echo "
+        msg_type: post
+        content:
+          post:
+            zh_cn:
+              title: '🤖 Github CI/CD 结果'
+              content:
+              - - tag: text
+                  text: '工作流：'
+                - tag: text
+                  text: ${{ github.workflow }}
+              - - tag: text
+                  text: '仓库：'
+                - tag: text
+                  text: ${{ github.repository }}
+              - - tag: text
+                  text: '触发事件：'
+                - tag: text
+                  text: ${{ github.event_name }}
+              - - tag: text
+                  text: '--------------------------'
+              - - tag: text
+                  text: '执行结果'
+                - tag: text
+                  text: 'OK-${{ github.action_status }}'
+        " > msg.yaml
+        cat msg.yaml
+
+    - name: convert msg from yaml to json (pretty json)
+      # 下方 EOF 语法，用于传输多行文本到 action 的 ENV 环境变量中
+      run: |
+        wget https://github.com/mikefarah/yq/releases/download/v4.16.2/yq_linux_amd64 \
+        && chmod +x yq_linux_amd64 \
+        && mv yq_linux_amd64 /usr/local/bin/yq
+        yq eval -o json msg.yaml |tee msg.json
+        echo 'MSG_JSON<<EOF' >> $GITHUB_ENV
+        cat msg.json >> $GITHUB_ENV
+        echo 'EOF' >> $GITHUB_ENV
+
+    - name: send messages to feishu -- Bot test
+      uses: Rollingegg/feishu-robot-action@v1
+      with:
+        version: 2
+        uuid: ${{ secrets.FEISHU_BOT_WEBSOCKET_ENDPOINT }}
+        secret: ${{ secrets.FEISHU_BOT_AUTHKEY }}
+        json: |
+          ${{ env.MSG_JSON }}
